@@ -6,9 +6,29 @@
 #include <time.h>
 #include <Preferences.h>
 #include <ArduinoOTA.h>
+#include "esp_camera.h"
+
+// --- Definición de Pines Cámara (AI Thinker) ---
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define LED_FLASH_GPIO    4
 
 // --- Variables Globales ---
-const String firmware_version = "1.1.0";
+const String firmware_version = "1.6.0";
 Preferences preferences;
 SemaphoreHandle_t dataMutex;
 TaskHandle_t networkTaskHandle;
@@ -28,7 +48,7 @@ int consoleHead = 0;
 bool consoleLooped = false;
 
 // --- Objetos Globales ---
-WebServer server(3000);
+WebServer server(80);
 
 // --- Funciones Auxiliares ---
 void getFormattedTime(char* buffer, size_t size) {
@@ -153,6 +173,56 @@ String getUniqueId() {
   return String((uint32_t)(mac >> 32), HEX) + String((uint32_t)mac, HEX);
 }
 
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    logToConsole("Error: Fallo al inicializar camara (0x" + String(err, HEX) + ")");
+    return false;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  // Ajustes iniciales para OV2640 (común en AI Thinker)
+  if (s->id.PID == OV2640_PID) {
+    s->set_vflip(s, 1); // Voltear si está al revés
+    s->set_hmirror(s, 1);
+  }
+  
+  logToConsole("Camara inicializada correctamente.");
+  return true;
+}
+
 // --- Tarea de Segundo Plano (Core 0) ---
 void networkTask(void * parameter) {
   for (;;) {
@@ -162,6 +232,116 @@ void networkTask(void * parameter) {
       xSemaphoreGive(dataMutex);
     }
     vTaskDelay(pdMS_TO_TICKS(5000)); 
+  }
+}
+
+// --- Handler de Streaming MJPEG ---
+void handleStream() {
+  WiFiClient client = server.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  server.sendContent(response);
+
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      logToConsole("Fallo captura de frame");
+      break;
+    }
+
+    String header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + String(fb->len) + "\r\n\r\n";
+    server.sendContent(header);
+    client.write(fb->buf, fb->len);
+    server.sendContent("\r\n");
+    
+    esp_camera_fb_return(fb);
+    // Pequeño delay para no saturar si es necesario
+    // delay(1); 
+  }
+}
+
+// --- Handlers de Cámara (Status y Control) ---
+void handleStatus() {
+  sensor_t * s = esp_camera_sensor_get();
+  if (!s) {
+    server.send(500, "text/plain", "Camara no inicializada");
+    return;
+  }
+  
+  String json = "{";
+  json += "\"framesize\":" + String(s->status.framesize) + ",";
+  json += "\"quality\":" + String(s->status.quality) + ",";
+  json += "\"brightness\":" + String(s->status.brightness) + ",";
+  json += "\"contrast\":" + String(s->status.contrast) + ",";
+  json += "\"saturation\":" + String(s->status.saturation) + ",";
+  json += "\"special_effect\":" + String(s->status.special_effect) + ",";
+  json += "\"wb_mode\":" + String(s->status.wb_mode) + ",";
+  json += "\"awb\":" + String(s->status.awb) + ",";
+  json += "\"awb_gain\":" + String(s->status.awb_gain) + ",";
+  json += "\"aec\":" + String(s->status.aec) + ",";
+  json += "\"aec2\":" + String(s->status.aec2) + ",";
+  json += "\"ae_level\":" + String(s->status.ae_level) + ",";
+  json += "\"aec_value\":" + String(s->status.aec_value) + ",";
+  json += "\"agc\":" + String(s->status.agc) + ",";
+  json += "\"agc_gain\":" + String(s->status.agc_gain) + ",";
+  json += "\"gainceiling\":" + String(s->status.gainceiling) + ",";
+  json += "\"bpc\":" + String(s->status.bpc) + ",";
+  json += "\"wpc\":" + String(s->status.wpc) + ",";
+  json += "\"raw_gma\":" + String(s->status.raw_gma) + ",";
+  json += "\"lenc\":" + String(s->status.lenc) + ",";
+  json += "\"vflip\":" + String(s->status.vflip) + ",";
+  json += "\"hmirror\":" + String(s->status.hmirror) + ",";
+  json += "\"dcw\":" + String(s->status.dcw) + ",";
+  json += "\"colorbar\":" + String(s->status.colorbar);
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleControl() {
+  if (!server.hasArg("var") || !server.hasArg("val")) {
+    server.send(400, "text/plain", "Faltan parametros var/val");
+    return;
+  }
+
+  String var = server.arg("var");
+  int val = server.arg("val").toInt();
+  sensor_t * s = esp_camera_sensor_get();
+  int res = 0;
+
+  if (var == "framesize") {
+    if (s->pixformat == PIXFORMAT_JPEG) res = s->set_framesize(s, (framesize_t)val);
+  } else if (var == "quality") res = s->set_quality(s, val);
+  else if (var == "contrast") res = s->set_contrast(s, val);
+  else if (var == "brightness") res = s->set_brightness(s, val);
+  else if (var == "saturation") res = s->set_saturation(s, val);
+  else if (var == "gainceiling") res = s->set_gainceiling(s, (gainceiling_t)val);
+  else if (var == "colorbar") res = s->set_colorbar(s, val);
+  else if (var == "awb") res = s->set_whitebal(s, val);
+  else if (var == "agc") res = s->set_gain_ctrl(s, val);
+  else if (var == "aec") res = s->set_exposure_ctrl(s, val);
+  else if (var == "hmirror") res = s->set_hmirror(s, val);
+  else if (var == "vflip") res = s->set_vflip(s, val);
+  else if (var == "awb_gain") res = s->set_awb_gain(s, val);
+  else if (var == "agc_gain") res = s->set_agc_gain(s, val);
+  else if (var == "aec_value") res = s->set_aec_value(s, val);
+  else if (var == "aec2") res = s->set_aec2(s, val);
+  else if (var == "dcw") res = s->set_dcw(s, val);
+  else if (var == "bpc") res = s->set_bpc(s, val);
+  else if (var == "wpc") res = s->set_wpc(s, val);
+  else if (var == "raw_gma") res = s->set_raw_gma(s, val);
+  else if (var == "lenc") res = s->set_lenc(s, val);
+  else if (var == "special_effect") res = s->set_special_effect(s, val);
+  else if (var == "wb_mode") res = s->set_wb_mode(s, val);
+  else if (var == "ae_level") res = s->set_ae_level(s, val);
+  else {
+    res = -1;
+  }
+
+  if (res == 0) {
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(500, "text/plain", "Error configurando camara");
   }
 }
 
@@ -325,14 +505,20 @@ void handleRoot() {
     chunk += "<strong>⚡ Uptime:</strong> " + String(uptimeBuf) + "</h3></div>";
     server.sendContent(chunk);
 
-    // --- Slide 2: Cámara (Nuevo) ---
+    // --- Slide 2: Cámara ---
     chunk = "<div class='carousel-slide fade'><h2>Cámara</h2><div class='emoji-container'><span class='emoji'>📷</span></div><br>";
-    chunk += "<p style='text-align:center;'>Vista previa no disponible</p></div>";
+    chunk += "<div style='text-align:center;'><img id='stream' src='' style='width:100%; border-radius:8px; display:none; background:#333;' alt='Stream'><br>";
+    chunk += "<button id='toggle-stream' class='button' onclick='toggleStream()'>▶️ Iniciar Stream</button></div></div>";
     server.sendContent(chunk);
 
-    // --- Slide 3: Config. de Cam. (Nuevo) ---
+    // --- Slide 3: Config. de Cam. ---
     chunk = "<div class='carousel-slide fade'><h2>Config. de Cam.</h2><div class='emoji-container'><span class='emoji'>🎛️</span></div><br>";
-    chunk += "<p style='text-align:center;'>Controles no disponibles</p></div>";
+    chunk += "<div id='cam-controls' style='font-size:0.9em;'>";
+    chunk += "<p><strong>Resolución:</strong><br><select id='framesize' onchange='updateCam(this)' style='width:100%; padding:8px;'>";
+    chunk += "<option value='13'>UXGA (1600x1200)</option><option value='11'>HD (1280x720)</option><option value='10'>XGA (1024x768)</option><option value='9'>SVGA (800x600)</option><option value='8'>VGA (640x480)</option><option value='5'>QVGA (320x240)</option></select></p>";
+    chunk += "<p><strong>Calidad (10-63):</strong><br><input type='range' id='quality' min='10' max='63' value='12' onchange='updateCam(this)' style='width:100%;'></p>";
+    chunk += "<p><strong>Brillo (-2 a 2):</strong><br><input type='range' id='brightness' min='-2' max='2' value='0' onchange='updateCam(this)' style='width:100%;'></p>";
+    chunk += "</div></div>";
     server.sendContent(chunk);
 
     // --- Slide 4: Consola Web ---
@@ -356,6 +542,8 @@ void handleRoot() {
     chunk += "<a class='prev' onclick='changeSlide(-1)'>&#10094;</a><a class='next' onclick='changeSlide(1)'>&#10095;</a>";
     chunk += "<div class='dots'><span class='dot' onclick='currentSlide(1)'></span><span class='dot' onclick='currentSlide(2)'></span><span class='dot' onclick='currentSlide(3)'></span><span class='dot' onclick='currentSlide(4)'></span><span class='dot' onclick='currentSlide(5)'></span></div></div>";
     chunk += "<script>let slideIndex=1;showSlide(slideIndex);function changeSlide(n){showSlide(slideIndex+=n)}function currentSlide(n){showSlide(slideIndex=n)}function showSlide(n){let i;let s=document.getElementsByClassName('carousel-slide');let d=document.getElementsByClassName('dot');if(n>s.length){slideIndex=1}if(n<1){slideIndex=s.length}for(i=0;i<s.length;i++){s[i].style.display='none'}for(i=0;i<d.length;i++){d[i].className=d[i].className.replace(' active','')};s[slideIndex-1].style.display='block';d[slideIndex-1].className+=' active'}function updateTime(){fetch('/time').then(r=>r.text()).then(d=>{if(d)document.getElementById('current-time').innerText=d})}setInterval(updateTime,900000);";
+    chunk += "function toggleStream(){let i=document.getElementById('stream');let b=document.getElementById('toggle-stream');if(i.style.display==='none'){i.src='/stream';i.style.display='block';b.innerText='⏹️ Detener Stream'}else{window.stop();i.src='';i.style.display='none';b.innerText='▶️ Iniciar Stream'}}";
+    chunk += "function updateCam(el){fetch('/control?var='+el.id+'&val='+el.value)}";
     chunk += "function updateConsole(){fetch('/console/logs').then(r=>r.text()).then(d=>{let c=document.getElementById('console-output');if(c.value!==d){c.value=d;c.scrollTop=c.scrollHeight}})}";
     chunk += "function sendCommand(){let i=document.getElementById('console-input');let v=i.value;if(!v)return;fetch('/console/cmd?cmd='+encodeURIComponent(v)).then(()=>{i.value='';updateConsole()})}";
     chunk += "function unlockConfig(){let p=document.getElementById('unlock-pass').value;let m=document.getElementById('unlock-msg');m.innerText='Verificando...';fetch('/config/get?pass='+encodeURIComponent(p)).then(r=>{if(r.status===200){return r.text()}else{throw new Error('Clave incorrecta')}}).then(h=>{document.getElementById('lock-screen').style.display='none';document.getElementById('config-content').innerHTML=h}).catch(e=>{m.innerText=e.message})}";
@@ -385,6 +573,8 @@ void setup() {
     logToConsole("Iniciando WebServer ESP32...");
 
     loadSettings();
+
+    initCamera();
 
     WiFi.mode(WIFI_STA); 
     delay(100); 
@@ -425,6 +615,9 @@ void setup() {
 
     server.on("/", handleRoot);
     server.on("/style.css", handleCss);
+    server.on("/stream", handleStream); // Ruta de streaming
+    server.on("/status", handleStatus); // Estado de camara
+    server.on("/control", handleControl); // Control de camara
     server.on("/time", handleTimeRequest);
     server.on("/save", HTTP_POST, handleSaveConfig);
     server.on("/config/get", handleGetConfig);
@@ -432,7 +625,7 @@ void setup() {
     server.on("/console/cmd", handleConsoleCommand);
     server.begin();
 
-    logToConsole("WebServer puerto 3000 activo");
+    logToConsole("WebServer puerto 80 activo");
 }
 
 void loop() {
