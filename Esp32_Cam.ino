@@ -7,6 +7,8 @@
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 #include "esp_camera.h"
+#include "FS.h"
+#include "SD_MMC.h"
 
 // --- Definición de Pines Cámara (AI Thinker) ---
 #define PWDN_GPIO_NUM     32
@@ -27,8 +29,13 @@
 #define PCLK_GPIO_NUM     22
 #define LED_FLASH_GPIO    4
 
+// --- Configuración PWM LED ---
+#define LED_PWM_CHANNEL   7 // Canal 7 para no chocar con la cámara (usa 0 y 1)
+#define LED_PWM_FREQ      5000
+#define LED_PWM_BITS      8
+
 // --- Variables Globales ---
-const String firmware_version = "1.6.0";
+const String firmware_version = "1.7.0";
 Preferences preferences;
 SemaphoreHandle_t dataMutex;
 TaskHandle_t networkTaskHandle;
@@ -197,9 +204,10 @@ bool initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
+    config.frame_size = FRAMESIZE_VGA; // Empezar en VGA para asegurar estabilidad
     config.jpeg_quality = 10;
     config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
@@ -213,13 +221,19 @@ bool initCamera() {
   }
 
   sensor_t * s = esp_camera_sensor_get();
-  // Ajustes iniciales para OV2640 (común en AI Thinker)
   if (s->id.PID == OV2640_PID) {
-    s->set_vflip(s, 1); // Voltear si está al revés
+    s->set_vflip(s, 1);
     s->set_hmirror(s, 1);
   }
   
-  logToConsole("Camara inicializada correctamente.");
+  // Drenar frames iniciales para estabilizar el sensor
+  for (int i = 0; i < 10; i++) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    delay(50);
+  }
+
+  logToConsole("Camara inicializada y estabilizada.");
   return true;
 }
 
@@ -255,8 +269,7 @@ void handleStream() {
     server.sendContent("\r\n");
     
     esp_camera_fb_return(fb);
-    // Pequeño delay para no saturar si es necesario
-    // delay(1); 
+    delay(1); // <--- AGREGADO: Pequeño respiro
   }
 }
 
@@ -334,6 +347,10 @@ void handleControl() {
   else if (var == "special_effect") res = s->set_special_effect(s, val);
   else if (var == "wb_mode") res = s->set_wb_mode(s, val);
   else if (var == "ae_level") res = s->set_ae_level(s, val);
+  else if (var == "flash") {
+    ledcWrite(LED_FLASH_GPIO, val); // Pin directo en v3.x
+    res = 0;
+  }
   else {
     res = -1;
   }
@@ -343,6 +360,38 @@ void handleControl() {
   } else {
     server.send(500, "text/plain", "Error configurando camara");
   }
+}
+
+// --- Handler de Captura a SD ---
+void handleCapture() {
+  if (SD_MMC.cardType() == CARD_NONE) {
+    server.send(500, "text/plain", "Error: No hay tarjeta SD");
+    return;
+  }
+
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Error: Fallo captura de camara");
+    return;
+  }
+
+  // Generar nombre de archivo único
+  String path = "/capture_" + String(millis()) + ".jpg";
+  
+  fs::FS &fs = SD_MMC;
+  File file = fs.open(path.c_str(), FILE_WRITE);
+  if (!file) {
+    server.send(500, "text/plain", "Error: Fallo al abrir archivo en SD");
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  file.write(fb->buf, fb->len);
+  file.close();
+  esp_camera_fb_return(fb);
+
+  logToConsole("Foto guardada: " + path);
+  server.send(200, "text/plain", "Guardado: " + path);
 }
 
 void handleSaveConfig() {
@@ -508,7 +557,11 @@ void handleRoot() {
     // --- Slide 2: Cámara ---
     chunk = "<div class='carousel-slide fade'><h2>Cámara</h2><div class='emoji-container'><span class='emoji'>📷</span></div><br>";
     chunk += "<div style='text-align:center;'><img id='stream' src='' style='width:100%; border-radius:8px; display:none; background:#333;' alt='Stream'><br>";
-    chunk += "<button id='toggle-stream' class='button' onclick='toggleStream()'>▶️ Iniciar Stream</button></div></div>";
+    chunk += "<div class='center-button' style='display:flex; justify-content:center; gap:10px; flex-wrap:wrap;'>";
+    chunk += "<button id='toggle-stream' class='button' onclick='toggleStream()'>▶️ Stream</button>";
+    chunk += "<button class='button' style='background-color:#2196F3;' onclick='takePhoto()'>📸 Capturar</button>";
+    chunk += "<button id='btn-flash' class='button' style='background-color:#FFC107; color:black;' onclick='toggleFlashQuick()'>🔦 Flash</button>";
+    chunk += "</div><p id='snap-msg' style='font-size:0.8em; color:green;'></p></div></div>";
     server.sendContent(chunk);
 
     // --- Slide 3: Config. de Cam. ---
@@ -516,8 +569,9 @@ void handleRoot() {
     chunk += "<div id='cam-controls' style='font-size:0.9em;'>";
     chunk += "<p><strong>Resolución:</strong><br><select id='framesize' onchange='updateCam(this)' style='width:100%; padding:8px;'>";
     chunk += "<option value='13'>UXGA (1600x1200)</option><option value='11'>HD (1280x720)</option><option value='10'>XGA (1024x768)</option><option value='9'>SVGA (800x600)</option><option value='8'>VGA (640x480)</option><option value='5'>QVGA (320x240)</option></select></p>";
+    chunk += "<p><strong>Brillo Flash:</strong><br><input type='range' id='flash' min='0' max='255' value='0' onchange='updateCam(this)' style='width:100%;'></p>";
     chunk += "<p><strong>Calidad (10-63):</strong><br><input type='range' id='quality' min='10' max='63' value='12' onchange='updateCam(this)' style='width:100%;'></p>";
-    chunk += "<p><strong>Brillo (-2 a 2):</strong><br><input type='range' id='brightness' min='-2' max='2' value='0' onchange='updateCam(this)' style='width:100%;'></p>";
+    chunk += "<p><strong>Brillo Cam (-2 a 2):</strong><br><input type='range' id='brightness' min='-2' max='2' value='0' onchange='updateCam(this)' style='width:100%;'></p>";
     chunk += "</div></div>";
     server.sendContent(chunk);
 
@@ -542,8 +596,10 @@ void handleRoot() {
     chunk += "<a class='prev' onclick='changeSlide(-1)'>&#10094;</a><a class='next' onclick='changeSlide(1)'>&#10095;</a>";
     chunk += "<div class='dots'><span class='dot' onclick='currentSlide(1)'></span><span class='dot' onclick='currentSlide(2)'></span><span class='dot' onclick='currentSlide(3)'></span><span class='dot' onclick='currentSlide(4)'></span><span class='dot' onclick='currentSlide(5)'></span></div></div>";
     chunk += "<script>let slideIndex=1;showSlide(slideIndex);function changeSlide(n){showSlide(slideIndex+=n)}function currentSlide(n){showSlide(slideIndex=n)}function showSlide(n){let i;let s=document.getElementsByClassName('carousel-slide');let d=document.getElementsByClassName('dot');if(n>s.length){slideIndex=1}if(n<1){slideIndex=s.length}for(i=0;i<s.length;i++){s[i].style.display='none'}for(i=0;i<d.length;i++){d[i].className=d[i].className.replace(' active','')};s[slideIndex-1].style.display='block';d[slideIndex-1].className+=' active'}function updateTime(){fetch('/time').then(r=>r.text()).then(d=>{if(d)document.getElementById('current-time').innerText=d})}setInterval(updateTime,900000);";
-    chunk += "function toggleStream(){let i=document.getElementById('stream');let b=document.getElementById('toggle-stream');if(i.style.display==='none'){i.src='/stream';i.style.display='block';b.innerText='⏹️ Detener Stream'}else{window.stop();i.src='';i.style.display='none';b.innerText='▶️ Iniciar Stream'}}";
+    chunk += "function toggleStream(){let i=document.getElementById('stream');let b=document.getElementById('toggle-stream');if(i.style.display==='none'){i.src='/stream';i.style.display='block';b.innerText='⏹️ Stop'}else{window.stop();i.src='';i.style.display='none';b.innerText='▶️ Stream'}}";
     chunk += "function updateCam(el){fetch('/control?var='+el.id+'&val='+el.value)}";
+    chunk += "let flashOn=false;function toggleFlashQuick(){flashOn=!flashOn;let v=flashOn?255:0;fetch('/control?var=flash&val='+v);document.getElementById('btn-flash').innerText=flashOn?'📴 Off':'🔦 Flash'}";
+    chunk += "function takePhoto(){let m=document.getElementById('snap-msg');m.innerText='Capturando...';fetch('/capture').then(r=>r.text()).then(t=>{m.innerText=t;setTimeout(()=>m.innerText='',3000)}).catch(e=>{m.innerText='Error: '+e.message})}";
     chunk += "function updateConsole(){fetch('/console/logs').then(r=>r.text()).then(d=>{let c=document.getElementById('console-output');if(c.value!==d){c.value=d;c.scrollTop=c.scrollHeight}})}";
     chunk += "function sendCommand(){let i=document.getElementById('console-input');let v=i.value;if(!v)return;fetch('/console/cmd?cmd='+encodeURIComponent(v)).then(()=>{i.value='';updateConsole()})}";
     chunk += "function unlockConfig(){let p=document.getElementById('unlock-pass').value;let m=document.getElementById('unlock-msg');m.innerText='Verificando...';fetch('/config/get?pass='+encodeURIComponent(p)).then(r=>{if(r.status===200){return r.text()}else{throw new Error('Clave incorrecta')}}).then(h=>{document.getElementById('lock-screen').style.display='none';document.getElementById('config-content').innerHTML=h}).catch(e=>{m.innerText=e.message})}";
@@ -576,6 +632,22 @@ void setup() {
 
     initCamera();
 
+    // Configurar PWM para Linterna (Nueva API v3.x)
+    ledcAttach(LED_FLASH_GPIO, LED_PWM_FREQ, LED_PWM_BITS);
+    ledcWrite(LED_FLASH_GPIO, 0); // Apagar al inicio
+
+    // Inicializar SD en modo 1-bit para liberar GPIO 4 (Flash)
+    if(!SD_MMC.begin("/sdcard", true)){
+      logToConsole("Error: Fallo al montar SD (o no insertada)");
+    } else {
+      uint8_t cardType = SD_MMC.cardType();
+      if(cardType == CARD_NONE){
+         logToConsole("Error: No hay tarjeta SD");
+      } else {
+         logToConsole("SD montada correctamente (1-bit mode)");
+      }
+    }
+
     WiFi.mode(WIFI_STA); 
     delay(100); 
     serial_number = WiFi.macAddress();
@@ -595,6 +667,7 @@ void setup() {
       logToConsole("Fallo WiFi. Reiniciando...");
       ESP.restart();
     }
+    WiFi.setSleep(false); // <--- AGREGADO: Desactivar ahorro de energia
     logToConsole("WiFi Conectado: " + WiFi.localIP().toString());
     localIP = WiFi.localIP().toString();
 
@@ -618,6 +691,7 @@ void setup() {
     server.on("/stream", handleStream); // Ruta de streaming
     server.on("/status", handleStatus); // Estado de camara
     server.on("/control", handleControl); // Control de camara
+    server.on("/capture", handleCapture); // Captura a SD
     server.on("/time", handleTimeRequest);
     server.on("/save", HTTP_POST, handleSaveConfig);
     server.on("/config/get", handleGetConfig);
