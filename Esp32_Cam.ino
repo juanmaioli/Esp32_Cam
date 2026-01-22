@@ -35,7 +35,7 @@
 #define LED_PWM_BITS      8
 
 // --- Variables Globales ---
-const String firmware_version = "1.8.0";
+const String firmware_version = "1.9.0";
 Preferences preferences;
 SemaphoreHandle_t dataMutex;
 TaskHandle_t networkTaskHandle;
@@ -362,99 +362,24 @@ void handleControl() {
   }
 }
 
-// --- Handler de Captura a SD ---
+// --- Handler de Captura (Descarga Directa) ---
 void handleCapture() {
-  if (SD_MMC.cardType() == CARD_NONE) {
-    server.send(500, "text/plain", "Error: No hay tarjeta SD");
-    return;
-  }
-
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     server.send(500, "text/plain", "Error: Fallo captura de camara");
     return;
   }
 
-  // Generar nombre de archivo único
-  String path = "/capture_" + String(millis()) + ".jpg";
+  // Configurar cabeceras para descarga de archivo
+  server.sendHeader("Content-Disposition", "attachment; filename=capture_" + String(millis()) + ".jpg");
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Connection", "close");
   
-  fs::FS &fs = SD_MMC;
-  File file = fs.open(path.c_str(), FILE_WRITE);
-  if (!file) {
-    server.send(500, "text/plain", "Error: Fallo al abrir archivo en SD");
-    esp_camera_fb_return(fb);
-    return;
-  }
-
-  file.write(fb->buf, fb->len);
-  file.close();
+  // Enviar el buffer de la imagen
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  
   esp_camera_fb_return(fb);
-
-  logToConsole("Foto guardada: " + path);
-  server.send(200, "text/plain", "Guardado: " + path);
-}
-
-// --- Handlers de Galería SD ---
-void handleFileList() {
-  if (SD_MMC.cardType() == CARD_NONE) {
-    server.send(500, "text/plain", "Error: No hay tarjeta SD");
-    return;
-  }
-
-  String json = "[";
-  File root = SD_MMC.open("/");
-  File file = root.openNextFile();
-  bool first = true;
-
-  while (file) {
-    if (!file.isDirectory() && String(file.name()).endsWith(".jpg")) {
-      if (!first) json += ",";
-      json += "\"" + String(file.name()) + "\"";
-      first = false;
-    }
-    file = root.openNextFile();
-  }
-  json += "]";
-  server.send(200, "application/json", json);
-}
-
-void handleFileView() {
-  if (!server.hasArg("path")) {
-    server.send(400, "text/plain", "Falta parametro path");
-    return;
-  }
-  String path = server.arg("path");
-  if (!path.startsWith("/")) path = "/" + path;
-
-  if (!SD_MMC.exists(path)) {
-    server.send(404, "text/plain", "Archivo no encontrado");
-    return;
-  }
-
-  File file = SD_MMC.open(path, FILE_READ);
-  if (!file) {
-    server.send(500, "text/plain", "Error al abrir archivo");
-    return;
-  }
-
-  server.streamFile(file, "image/jpeg");
-  file.close();
-}
-
-void handleFileDelete() {
-  if (!server.hasArg("path")) {
-    server.send(400, "text/plain", "Falta parametro path");
-    return;
-  }
-  String path = server.arg("path");
-  if (!path.startsWith("/")) path = "/" + path;
-
-  if (SD_MMC.remove(path)) {
-    logToConsole("Archivo borrado: " + path);
-    server.send(200, "text/plain", "OK");
-  } else {
-    server.send(500, "text/plain", "Error al borrar archivo");
-  }
 }
 
 void handleSaveConfig() {
@@ -638,13 +563,7 @@ void handleRoot() {
     chunk += "</div></div>";
     server.sendContent(chunk);
 
-    // --- Slide 4: Galería (Nueva) ---
-    chunk = "<div class='carousel-slide fade'><h2>Galería SD</h2><div class='emoji-container'><span class='emoji'>🖼️</span></div><br>";
-    chunk += "<div class='center-button'><button class='button' onclick='refreshGallery()'>🔄 Actualizar Lista</button></div>";
-    chunk += "<div id='gallery-list' style='font-size:0.8em; margin-top:10px; max-height:200px; overflow-y:auto; border:1px solid #444; padding:5px; border-radius:4px;'></div></div>";
-    server.sendContent(chunk);
-
-    // --- Slide 5: Consola Web ---
+    // --- Slide 4: Consola Web ---
     chunk = "<div class='carousel-slide fade'><h2>Consola Web</h2><div class='emoji-container'><span class='emoji'>💻</span></div><br>";
     chunk += "<textarea id='console-output' readonly>Cargando logs...</textarea>";
     chunk += "<div class='center-button'><input type='text' id='console-input' placeholder='Escribe un comando...'><button id='console-send' class='button' onclick='sendCommand()'>Env</button></div>";
@@ -663,15 +582,12 @@ void handleRoot() {
 
     chunk = "</div>"; // Cierra carousel-container
     chunk += "<a class='prev' onclick='changeSlide(-1)'>&#10094;</a><a class='next' onclick='changeSlide(1)'>&#10095;</a>";
-    chunk += "<div class='dots'><span class='dot' onclick='currentSlide(1)'></span><span class='dot' onclick='currentSlide(2)'></span><span class='dot' onclick='currentSlide(3)'></span><span class='dot' onclick='currentSlide(4)'></span><span class='dot' onclick='currentSlide(5)'></span><span class='dot' onclick='currentSlide(6)'></span></div></div>";
+    chunk += "<div class='dots'><span class='dot' onclick='currentSlide(1)'></span><span class='dot' onclick='currentSlide(2)'></span><span class='dot' onclick='currentSlide(3)'></span><span class='dot' onclick='currentSlide(4)'></span><span class='dot' onclick='currentSlide(5)'></span></div></div>";
     chunk += "<script>let slideIndex=1;showSlide(slideIndex);function changeSlide(n){showSlide(slideIndex+=n)}function currentSlide(n){showSlide(slideIndex=n)}function showSlide(n){let i;let s=document.getElementsByClassName('carousel-slide');let d=document.getElementsByClassName('dot');if(n>s.length){slideIndex=1}if(n<1){slideIndex=s.length}for(i=0;i<s.length;i++){s[i].style.display='none'}for(i=0;i<d.length;i++){d[i].className=d[i].className.replace(' active','')};s[slideIndex-1].style.display='block';d[slideIndex-1].className+=' active'}function updateTime(){fetch('/time').then(r=>r.text()).then(d=>{if(d)document.getElementById('current-time').innerText=d})}setInterval(updateTime,900000);";
     chunk += "function toggleStream(){let i=document.getElementById('stream');let b=document.getElementById('toggle-stream');if(i.style.display==='none'){i.src='/stream';i.style.display='block';b.innerText='⏹️ Stop'}else{window.stop();i.src='';i.style.display='none';b.innerText='▶️ Stream'}}";
     chunk += "function updateCam(el){fetch('/control?var='+el.id+'&val='+el.value)}";
     chunk += "let flashOn=false;function toggleFlashQuick(){flashOn=!flashOn;let v=flashOn?255:0;fetch('/control?var=flash&val='+v);document.getElementById('btn-flash').innerText=flashOn?'📴 Off':'🔦 Flash'}";
-    chunk += "function takePhoto(){let m=document.getElementById('snap-msg');m.innerText='Capturando...';fetch('/capture').then(r=>r.text()).then(t=>{m.innerText=t;setTimeout(()=>m.innerText='',3000);refreshGallery()}).catch(e=>{m.innerText='Error: '+e.message})}";
-    chunk += "function refreshGallery(){let l=document.getElementById('gallery-list');l.innerHTML='Cargando...';fetch('/list').then(r=>r.json()).then(d=>{l.innerHTML='';if(d.length===0){l.innerHTML='No hay fotos.'}else{d.reverse().forEach(f=>{let r=document.createElement('div');r.style='display:flex; justify-content:space-between; align-items:center; margin-bottom:5px; border-bottom:1px solid #333; padding-bottom:5px;';r.innerHTML='<span>'+f+'</span><div><button class=\"button\" style=\"padding:5px 10px; font-size:0.8em;\" onclick=\"viewFile(\\''+f+'\\')\">👁️</button><button class=\"button\" style=\"padding:5px 10px; font-size:0.8em; background-color:#f44336;\" onclick=\"deleteFile(\\''+f+'\\')\">🗑️</button></div>';l.appendChild(r)})}})}";
-    chunk += "function viewFile(p){window.open('/view?path='+encodeURIComponent(p),'_blank')}";
-    chunk += "function deleteFile(p){if(confirm('¿Borrar '+p+'?')){fetch('/delete?path='+encodeURIComponent(p)).then(()=>refreshGallery())}}";
+    chunk += "function takePhoto(){window.location.href='/capture'}";
     chunk += "function updateConsole(){fetch('/console/logs').then(r=>r.text()).then(d=>{let c=document.getElementById('console-output');if(c.value!==d){c.value=d;c.scrollTop=c.scrollHeight}})}";
     chunk += "function sendCommand(){let i=document.getElementById('console-input');let v=i.value;if(!v)return;fetch('/console/cmd?cmd='+encodeURIComponent(v)).then(()=>{i.value='';updateConsole()})}";
     chunk += "function unlockConfig(){let p=document.getElementById('unlock-pass').value;let m=document.getElementById('unlock-msg');m.innerText='Verificando...';fetch('/config/get?pass='+encodeURIComponent(p)).then(r=>{if(r.status===200){return r.text()}else{throw new Error('Clave incorrecta')}}).then(h=>{document.getElementById('lock-screen').style.display='none';document.getElementById('config-content').innerHTML=h}).catch(e=>{m.innerText=e.message})}";
@@ -704,21 +620,9 @@ void setup() {
 
     initCamera();
 
-    // Configurar PWM para Linterna (Nueva API v3.x)
+    // 2. Configurar PWM para Linterna (v3.x)
     ledcAttach(LED_FLASH_GPIO, LED_PWM_FREQ, LED_PWM_BITS);
-    ledcWrite(LED_FLASH_GPIO, 0); // Apagar al inicio
-
-    // Inicializar SD en modo 1-bit para liberar GPIO 4 (Flash)
-    if(!SD_MMC.begin("/sdcard", true)){
-      logToConsole("Error: Fallo al montar SD (o no insertada)");
-    } else {
-      uint8_t cardType = SD_MMC.cardType();
-      if(cardType == CARD_NONE){
-         logToConsole("Error: No hay tarjeta SD");
-      } else {
-         logToConsole("SD montada correctamente (1-bit mode)");
-      }
-    }
+    ledcWrite(LED_FLASH_GPIO, 0); 
 
     WiFi.mode(WIFI_STA); 
     delay(100); 
@@ -763,10 +667,7 @@ void setup() {
     server.on("/stream", handleStream); // Ruta de streaming
     server.on("/status", handleStatus); // Estado de camara
     server.on("/control", handleControl); // Control de camara
-    server.on("/capture", handleCapture); // Captura a SD
-    server.on("/list", handleFileList);   // Listar archivos SD
-    server.on("/view", handleFileView);   // Ver archivo SD
-    server.on("/delete", handleFileDelete); // Borrar archivo SD
+    server.on("/capture", handleCapture); // Captura a Descarga
     server.on("/time", handleTimeRequest);
     server.on("/save", HTTP_POST, handleSaveConfig);
     server.on("/config/get", handleGetConfig);
